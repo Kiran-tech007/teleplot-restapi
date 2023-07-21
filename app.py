@@ -38,8 +38,6 @@ udp_port_mapper = {
 
 pcmlist = ['PCM01', 'PCM02', 'PCM03', 'PCM04', 'PCM05', 'PCM06']
 
-lock = threading.Lock()
-
 
 class TelemetrySender:
     def __init__(self, teleplot_addr, topic):
