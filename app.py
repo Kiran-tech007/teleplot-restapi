@@ -22,13 +22,10 @@ signal.signal(signal.SIGINT, signal_handler)
 
 load_dotenv()
 start_udp = int(os.getenv('START_UDP'))
-global server_ip
 server_ip = os.getenv('SERVER_IP')
 
 udp_ports = [start_udp + i for i in range(6)]
 
-global udp_port_mapper, pcm_mapper, consumers
-stop_flag = threading.Event()
 
 udp_port_mapper = {
     'PCM01': udp_ports[0],
@@ -39,13 +36,9 @@ udp_port_mapper = {
     'PCM06': udp_ports[5]
 }
 
-global pcmlist
 pcmlist = ['PCM01', 'PCM02', 'PCM03', 'PCM04', 'PCM05', 'PCM06']
 
-pcm_mapper = dict()
-consumers = []
-pcm_mapper_lock = threading.Lock()
-consumers_lock = threading.Lock()
+lock = threading.Lock()
 
 
 class TelemetrySender:
@@ -53,6 +46,9 @@ class TelemetrySender:
         self.teleplot_addr = teleplot_addr
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.topic = topic
+
+    def __del__(self):
+        self.udp_socket.close()
 
     @staticmethod
     def time_to_milliseconds(input_time):
@@ -79,6 +75,7 @@ class KafkaConsumer:
         self.consumer = None
         self.telemetry_sender = telemetry_sender
         self.selected_params = selected_params
+        self.stop_flag = False
 
     def initialize(self):
         conf = {
@@ -90,43 +87,39 @@ class KafkaConsumer:
         self.consumer.subscribe([self.topic])
 
     def poll_messages(self):
-        global stop_flag
-        while not stop_flag.is_set():
-            msg = self.consumer.poll(100.0)
+        try:
+            while not self.stop_flag:
+                msg = self.consumer.poll(100.0)
 
-            if msg is None:
-                continue
-            if msg.error():
-                raise KafkaException(msg.error())
+                if msg is None:
+                    continue
+                if msg.error():
+                    raise KafkaException(msg.error())
 
-            key = msg.key().decode('utf-8')
-            if key not in self.selected_params:
-                continue
+                key = msg.key().decode('utf-8')
+                if key not in self.selected_params:
+                    continue
 
-            value = msg.value().decode('utf-8')
-            value = json.loads(value)
-            self.telemetry_sender.send_telemetry(
-                key, value["Processed"], value["Time_id"])
+                value = msg.value().decode('utf-8')
+                value = json.loads(value)
+                self.telemetry_sender.send_telemetry(
+                    key, value["Processed"], value["Time_id"])
+        except Exception as e:
+            print(f'KafkaError: {str(e)}')
 
     def close(self):
-        global stop_flag
-        if not stop_flag.is_set():
-            stop_flag.set()
-
-        with pcm_mapper_lock:
-            if self.topic in pcm_mapper:
-                del pcm_mapper[self.topic]
-
+        if not self.stop_flag:
+            self.stop_flag = True
         if self.consumer:
             self.consumer.close()
             self.consumer = None
 
-        if self.telemetry_sender:
-            self.telemetry_sender.close()
-            self.telemetry_sender = None
-
 
 class ConsumerController:
+    def __init__(self):
+        self.consumers = []
+        self.consumers_lock = threading.Lock()
+
     def start_consumer(self, bootstrap_servers: str, topic: str, udp_port: int, selected_params: set):
         try:
             telemetry_sender = TelemetrySender(
@@ -134,24 +127,21 @@ class ConsumerController:
             consumer = KafkaConsumer(
                 bootstrap_servers, topic, telemetry_sender, selected_params)
             consumer.initialize()
-            with consumers_lock:
-                consumers.append(consumer)
+            with self.consumers_lock:
+                self.consumers.append(consumer)
             consumer.poll_messages()
 
         except KafkaException as e:
             print(f'KafkaError: {str(e)}')
-            self.stop_consumer()
+            with self.consumers_lock:
+                for consumer in self.consumers:
+                    consumer.close()
 
     def stop_consumer(self):
-        global stop_flag, consumers
-        if not stop_flag.is_set():
-            stop_flag.set()
-
-        with consumers_lock:
-            for consumer in consumers:
+        with self.consumers_lock:
+            for consumer in self.consumers:
                 consumer.close()
-            consumers = []
-        stop_flag.clear()
+            self.consumers = []
 
 
 class PlotRequest(BaseModel):
@@ -172,31 +162,40 @@ def ping():
 @app.post("/plots")
 def receive_plots(plot_request: PlotRequest):
     try:
-        with pcm_mapper_lock:
-            if plot_request.topic in pcm_mapper:
-                return {"message": f"Consumer for {plot_request.topic} is already present."}
-            for pcm in pcmlist:
-                if plot_request.topic.find(pcm) > -1:
-                    pcm_id = pcm
-                    break
-            pcm_mapper[plot_request.topic] = pcm_id
+        with consumer_controller.consumers_lock:
+            for consumer in consumer_controller.consumers:
+                if consumer.topic == plot_request.topic:
+                    raise HTTPException(
+                        status_code=400, detail=f'Consumer for {plot_request.topic} already exists.')
+        global pcmlist
+        for pcm in pcmlist:
+            if pcm in plot_request.topic:
+                pcm_id = pcm
+                break
 
         thread = threading.Thread(target=consumer_controller.start_consumer, args=(
             plot_request.bootstrap_servers, plot_request.topic, udp_port_mapper[pcm_id], set(plot_request.parameters)))
         thread.start()
-        return {"message": f'Consumer for {plot_request.topic} started.'}
+        return {"message": f'Consumer for {plot_request.topic} is starting shortly.'}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/cleanup")
 def stop_consumer_endpoint():
-
     consumer_controller.stop_consumer()
-    with pcm_mapper_lock:
-        global pcm_mapper
-        pcm_mapper = dict()
-    return {"message": "Consumer stopped successfully."}
+    return {"message": "All the kafka consumers stopped successfully."}
+
+
+@app.get("/stop_topic")
+def stop_topic(topic: str):
+    with consumer_controller.consumers_lock:
+        for consumer in consumer_controller.consumers.copy():
+            if consumer.topic == topic:
+                consumer.close()
+                consumer_controller.consumers.remove(consumer)
+                return {"message": f'Consumer for {topic} stopped successfully.'}
+    return {"message": f'Consumer for {topic} not found.'}
 
 
 if __name__ == "__main__":
